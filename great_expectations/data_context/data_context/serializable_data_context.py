@@ -345,9 +345,18 @@ class SerializableDataContext(AbstractDataContext):
         if yml_path is None:
             return False
 
-        with open(yml_path, encoding="utf-8") as f:
-            config_commented_map_from_yaml = yaml.load(f)
-            config_commented_map_from_yaml["config_version"] = float(config_version)
+        try:
+            with open(yml_path, encoding="utf-8") as f:
+                config_commented_map_from_yaml = yaml.load(f)
+                config_commented_map_from_yaml["config_version"] = float(config_version)
+        except UnicodeDecodeError as e:
+            raise gx_exceptions.InvalidConfigurationYamlError(  # noqa: TRY003
+                f"{yml_path} is not valid UTF-8, so great_expectations cannot read it: {e}.\n"
+                "Great Expectations reads and writes this file as UTF-8. Bytes in another codec "
+                "come from a hand edit or from a version that used the host locale, and the "
+                "loader path in FileDataContext (file_data_context.py:197) cannot read them "
+                "either."
+            ) from e
 
         with open(yml_path, "w", encoding="utf-8") as f:
             yaml.dump(config_commented_map_from_yaml, f)

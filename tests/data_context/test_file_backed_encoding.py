@@ -439,3 +439,47 @@ def test_config_variables_round_trip_non_ascii_value_under_non_utf8_locale(
 
     assert reload_result.returncode == 0, reload_result.stderr
     assert "OK" in reload_result.stdout
+
+
+@pytest.mark.filesystem
+def test_a_non_utf8_project_yaml_is_unreadable_before_this_fix_rewrites_it(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The scenario raised in review on #12204 and reproduced by #12208: a
+    great_expectations.yml whose bytes are cp1252, which is what
+    set_ge_config_version()'s unpinned read-modify-write used to leave behind on a host
+    whose locale codec is not UTF-8.
+
+    Pinning the read makes this call site raise, which is the behavior change under
+    review. What the measurement adds is what those bytes were good for before: nothing.
+    The save and load paths in FileDataContext were already pinned to UTF-8 before this PR
+    (file_data_context.py:185 and :197, both untouched here), so a project config left in
+    the host codec was unreadable by the next normal GX operation on the same host.
+
+    Pinning both halves of that: the call now reports the offending path instead of
+    failing with a bare decode error, and the bytes the unpinned write produced are
+    themselves not readable as UTF-8.
+    """  # FIXME CoP
+    from great_expectations.data_context.data_context.serializable_data_context import (
+        SerializableDataContext,
+    )
+    from great_expectations.exceptions import InvalidConfigurationYamlError
+
+    project_root_dir = tmp_path / "project"
+    gx_dir = project_root_dir / "gx"
+    gx_dir.mkdir(parents=True)
+    yml_path = gx_dir / "great_expectations.yml"
+
+    cp1252_value = "Prüfung ünïcödé Straße café naïve"
+    yml_path.write_bytes(PROJECT_YAML_TEMPLATE.format(value=cp1252_value).encode("cp1252"))
+
+    with pytest.raises(InvalidConfigurationYamlError) as excinfo:
+        SerializableDataContext.set_ge_config_version(3.1, context_root_dir=str(project_root_dir))
+
+    assert str(yml_path) in str(excinfo.value), "the error does not name the unreadable file"
+
+    # The bytes the pre-fix read-modify-write left behind are not UTF-8 either, which is
+    # why the pinned loader path cannot open such a project.
+    with pytest.raises(UnicodeDecodeError):
+        with open(yml_path, encoding="utf-8") as f:
+            f.read()
