@@ -913,6 +913,7 @@ class _QueryExpectationForConfigurationTests(QueryExpectation):
     success_keys: ClassVar[Tuple[str, ...]] = ("query",)
     domain_keys: ClassVar[Tuple[str, ...]] = ("batch_id", "row_condition", "condition_parser")
 
+    @override
     def _validate(self, metrics, runtime_configuration=None, execution_engine=None):
         return {"success": True, "result": {"observed_value": None}}
 
