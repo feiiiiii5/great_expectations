@@ -11,7 +11,7 @@ from great_expectations.compatibility.sqlalchemy import sqltypes
 from great_expectations.datasource.fluent.interfaces import Batch
 from great_expectations.expectations.row_conditions import (
     Column,
-    Condition,
+    RowConditionType,
     PassThroughCondition,
 )
 from tests.integration.conftest import parameterize_batch_for_data_sources
@@ -211,7 +211,7 @@ COLUMN_NAME_NEEDS_ESCAPING_DATA = pd.DataFrame(
     data=COLUMN_NAME_NEEDS_ESCAPING_DATA,
 )
 def test_pandas_row_condition_on_column_name_needing_escaping(
-    batch_for_datasource: Batch, row_condition: Condition, expected_min: float
+    batch_for_datasource: Batch, row_condition: RowConditionType, expected_min: float
 ) -> None:
     """``DataFrame.query`` parses its expression, so a spaced column name needs backticks.
 
