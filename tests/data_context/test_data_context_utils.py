@@ -650,7 +650,9 @@ def test_mask_db_url_with_urlparse_matches_sqlalchemy_rendering():
     normalised ordering and percent-encoding of a query dict, which the stdlib parser here
     does not reproduce - the difference is ordering only, never a dropped or invented component.
     """
-    sa = pytest.importorskip("sqlalchemy")
+    pytest.importorskip("sqlalchemy")
+    from sqlalchemy.engine.url import make_url
+
     for url in [
         "postgresql://scott:tiger@h:5432/db?sslmode=require",
         "postgresql://scott:tiger@[::1]:5432/db?sslmode=require",
@@ -658,7 +660,7 @@ def test_mask_db_url_with_urlparse_matches_sqlalchemy_rendering():
         "bigquery://my-project/dataset",
         "sqlite:///foo/bar.db",
     ]:
-        assert PasswordMasker.mask_db_url(url, use_urlparse=True) == sa.make_url(url).__repr__()
+        assert PasswordMasker.mask_db_url(url, use_urlparse=True) == make_url(url).__repr__()
 
 
 @pytest.mark.unit
