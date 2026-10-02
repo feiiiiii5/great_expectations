@@ -927,6 +927,37 @@ class TestConditionToFilterClause:
 
     @pytest.mark.unit
     @pytest.mark.parametrize(
+        "column_name,expected_reference",
+        [
+            pytest.param("email", "email", id="plain-identifier-unchanged"),
+            pytest.param("Total Amount", "`Total Amount`", id="space"),
+            pytest.param("a.b", "`a.b`", id="dot"),
+            pytest.param("x-y", "`x-y`", id="hyphen"),
+            pytest.param("from", "`from`", id="python-keyword"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "is_null,expected_template",
+        [
+            pytest.param(True, "{}.isnull()", id="is_null"),
+            pytest.param(False, "~{}.isnull()", id="is_not_null"),
+        ],
+    )
+    def test_nullity_condition_escapes_column_name_pandas_cannot_parse(
+        self,
+        column_name: str,
+        expected_reference: str,
+        is_null: bool,
+        expected_template: str,
+    ) -> None:
+        engine = PandasExecutionEngine()
+        condition = NullityCondition(column=Column(column_name), is_null=is_null)
+
+        result = engine.condition_to_filter_clause(condition)
+        assert result == expected_template.format(expected_reference)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
         "column_name",
         [
             pytest.param("Total Amount", id="space"),
