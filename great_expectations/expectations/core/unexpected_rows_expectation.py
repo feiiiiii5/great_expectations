@@ -128,7 +128,23 @@ class UnexpectedRowsExpectation(BatchExpectation):
         if isinstance(query, SuiteParameterDict):
             return query
 
-        parsed_fields = [f[1] for f in Formatter().parse(query)]
+        try:
+            parsed_fields = [f[1] for f in Formatter().parse(query)]
+        except ValueError as exc:
+            # Imported here rather than at module level: a module-level import of the metrics
+            # package makes the type check report unused `type: ignore` comments in unrelated
+            # modules.
+            from great_expectations.expectations.metrics.query_metric_provider import (
+                LITERAL_BRACE_HINT,
+            )
+
+            # A brace that never pairs is caught here, at construction, rather than when the
+            # query is first substituted at validation time. Still a `ValueError`, so pydantic
+            # reports it as a validation error as before.
+            raise ValueError(  # noqa: TRY003 # message carries the query and the escaping rule
+                f"unexpected_rows_query contains an unpaired or malformed brace: {exc}. "
+                f"{LITERAL_BRACE_HINT} Query: {query}"
+            ) from exc
         if "batch" not in parsed_fields:
             batch_warning_message = (
                 "unexpected_rows_query should contain the {batch} parameter. "
