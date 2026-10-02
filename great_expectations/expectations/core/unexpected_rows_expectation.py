@@ -15,6 +15,7 @@ from great_expectations.expectations.expectation import (
     render_suite_parameter_string,
 )
 from great_expectations.expectations.metadata_types import DataQualityIssues, SupportedDataSources
+from great_expectations.expectations.metrics.query_metric_provider import LITERAL_BRACE_HINT
 from great_expectations.expectations.model_field_descriptions import FAILURE_SEVERITY_DESCRIPTION
 from great_expectations.render import (
     AtomicDiagnosticRendererType,
@@ -131,13 +132,6 @@ class UnexpectedRowsExpectation(BatchExpectation):
         try:
             parsed_fields = [f[1] for f in Formatter().parse(query)]
         except ValueError as exc:
-            # Imported here rather than at module level: a module-level import of the metrics
-            # package makes the type check report unused `type: ignore` comments in unrelated
-            # modules.
-            from great_expectations.expectations.metrics.query_metric_provider import (
-                LITERAL_BRACE_HINT,
-            )
-
             # A brace that never pairs is caught here, at construction, rather than when the
             # query is first substituted at validation time. Still a `ValueError`, so pydantic
             # reports it as a validation error as before.
