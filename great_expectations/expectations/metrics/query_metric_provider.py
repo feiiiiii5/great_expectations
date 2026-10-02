@@ -118,12 +118,12 @@ class InvalidParameterTypeError(TypeError):
         super().__init__(f"`{parameter_name}` must be provided as type `{expected_type}`.")
 
 
-_LITERAL_BRACE_HINT = "To include a literal brace in the query, double it: `{{` and `}}`."
+LITERAL_BRACE_HINT = "To include a literal brace in the query, double it: `{{` and `}}`."
 
 
 class UnsubstitutableQueryBraceError(ValueError):
     def __init__(self, query: str, reason: str):
-        super().__init__(f"{reason} {_LITERAL_BRACE_HINT} Query: {query}")
+        super().__init__(f"{reason} {LITERAL_BRACE_HINT} Query: {query}")
 
 
 class QueryParameters(TypedDict):
@@ -208,13 +208,16 @@ class QueryMetricProvider(MetricProvider):
             return {**query_parameters}
 
     @classmethod
-    def _format_query(cls, query: str, **kwargs: Any) -> str:
+    def _format_query(cls, query: str, /, **kwargs: Any) -> str:
         """Substitute `{batch}` and the declared query parameters into a user-authored query.
 
         `str.format` reads every brace in the query as a field name, so SQL that carries braces
         for its own reasons -- a Postgres array or JSON literal, a `LIKE '{%'` pattern -- raises
         here. The stdlib error names neither the query nor the doubling rule that escapes it, so
         it is replaced with one that does; a query that formatted before still formats the same.
+
+        `query` is positional-only so a substitution keyword named `query` (a `template_dict` key,
+        for instance) reaches `str.format` instead of colliding with this parameter.
         """
         try:
             return query.format(**kwargs)
@@ -222,9 +225,17 @@ class QueryMetricProvider(MetricProvider):
             raise UnsubstitutableQueryBraceError(
                 query, f"`{exc.args[0]}` is not a placeholder this metric accepts."
             ) from exc
-        except (IndexError, ValueError) as exc:
+        except IndexError as exc:
+            # `{}` and `{3}` are positional fields; this metric only fills named ones. The braces
+            # close, so the usual cause is a regex quantifier such as `x{3}`, not a typo.
             raise UnsubstitutableQueryBraceError(
-                query, f"The query contains a brace that does not close: {exc}"
+                query,
+                "The query contains a positional placeholder such as `{}` or `{3}` that this "
+                "metric does not fill; a regex quantifier like `x{3}` is the usual cause.",
+            ) from exc
+        except ValueError as exc:
+            raise UnsubstitutableQueryBraceError(
+                query, f"The query contains an unpaired or malformed brace: {exc}."
             ) from exc
 
     @classmethod

@@ -2,6 +2,7 @@ from typing import Any, ClassVar, Optional
 from unittest import mock
 from unittest.mock import create_autospec
 
+import pandas as pd
 import pytest
 from sqlalchemy.dialects import mysql, oracle  # noqa: F401 # registers sa.dialects.oracle
 
@@ -25,6 +26,7 @@ from great_expectations.expectations.metrics.query_metrics import (
     QueryTable,
     QueryTemplateValues,
 )
+from great_expectations.self_check.util import build_spark_engine
 from tests.expectations.metrics.conftest import MockSqlAlchemyExecutionEngine
 
 
@@ -36,6 +38,15 @@ def _call_sqlalchemy_metric(metric_cls: Any, **kwargs: Any) -> Any:
     the metric machinery passes the class, which is what these tests reproduce.
     """
     return metric_cls._sqlalchemy(cls=metric_cls, **kwargs)
+
+
+def _call_spark_metric(metric_cls: Any, **kwargs: Any) -> Any:
+    """Invoke a query metric provider's ``_spark`` value function directly.
+
+    The Spark counterpart of ``_call_sqlalchemy_metric``: ``_spark`` is likewise a plain function
+    whose first parameter is the class the metric machinery would pass.
+    """
+    return metric_cls._spark(cls=metric_cls, **kwargs)
 
 
 @pytest.mark.unit
@@ -1228,6 +1239,70 @@ class TestUserQueryBraceSubstitution:
         assert isinstance(exc_info.value.__cause__, ValueError)
 
     @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "query",
+        [
+            pytest.param("SELECT * FROM {batch} WHERE code ~ '^[a-z]{3}$'", id="regex quantifier"),
+            pytest.param("SELECT {} FROM {batch}", id="empty positional field"),
+            pytest.param("SELECT {3} FROM {batch}", id="numbered positional field"),
+        ],
+    )
+    def test_positional_placeholder_is_reported_as_unfilled_not_unclosed(
+        self,
+        mock_sqlalchemy_execution_engine: MockSqlAlchemyExecutionEngine,
+        batch_selectable: sa.Table,
+        query: str,
+    ) -> None:
+        """`{}` and `{3}` are braces that close; the problem is a positional field this metric
+        never fills. Calling them unclosed sends the reader looking for a typo that is not there.
+        """
+        with pytest.raises(UnsubstitutableQueryBraceError) as exc_info:
+            QueryMetricProvider._get_substituted_batch_subquery_from_query_and_batch_selectable(
+                query=query,
+                batch_selectable=batch_selectable,
+                execution_engine=mock_sqlalchemy_execution_engine,
+            )
+
+        message = str(exc_info.value)
+        assert "positional placeholder" in message
+        assert "regex quantifier" in message
+        assert "does not close" not in message
+        assert "unpaired or malformed" not in message
+        assert "double it" in message
+        assert query in message
+        assert isinstance(exc_info.value.__cause__, IndexError)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "query",
+        [
+            pytest.param("SELECT * FROM {batch} WHERE name LIKE '{%'", id="open brace, no close"),
+            pytest.param("SELECT * FROM {batch} WHERE name LIKE '%}'", id="lone close brace"),
+            pytest.param("SELECT * FROM {batch!x}", id="unknown conversion"),
+        ],
+    )
+    def test_unpaired_or_malformed_brace_is_reported_as_such(
+        self,
+        mock_sqlalchemy_execution_engine: MockSqlAlchemyExecutionEngine,
+        batch_selectable: sa.Table,
+        query: str,
+    ) -> None:
+        with pytest.raises(UnsubstitutableQueryBraceError) as exc_info:
+            QueryMetricProvider._get_substituted_batch_subquery_from_query_and_batch_selectable(
+                query=query,
+                batch_selectable=batch_selectable,
+                execution_engine=mock_sqlalchemy_execution_engine,
+            )
+
+        message = str(exc_info.value)
+        assert "unpaired or malformed brace" in message
+        assert "positional placeholder" not in message
+        assert "does not close" not in message
+        assert "double it" in message
+        assert query in message
+        assert isinstance(exc_info.value.__cause__, ValueError)
+
+    @pytest.mark.unit
     def test_brace_error_is_also_reported_for_the_row_condition_branch(
         self,
         mock_sqlalchemy_execution_engine: MockSqlAlchemyExecutionEngine,
@@ -1276,3 +1351,179 @@ class TestUserQueryBraceSubstitution:
             )
         )
         assert result == "SELECT * FROM my_table WHERE passenger_count > 7"
+
+
+class TestQueryTemplateValuesBraceSubstitution:
+    """`QueryTemplateValues` formats the user's query itself rather than through
+    `_get_substituted_batch_subquery_from_query_and_batch_selectable`, so it needs the same
+    report for a brace that is SQL rather than a placeholder.
+    """
+
+    @pytest.mark.unit
+    def test_unsubstitutable_brace_in_query_is_reported(
+        self,
+        mock_sqlalchemy_execution_engine: MockSqlAlchemyExecutionEngine,
+    ) -> None:
+        query = "SELECT * FROM {batch} WHERE tags = '{active}'"
+
+        with pytest.raises(UnsubstitutableQueryBraceError) as exc_info:
+            _call_sqlalchemy_metric(
+                QueryTemplateValues,
+                execution_engine=mock_sqlalchemy_execution_engine,
+                metric_domain_kwargs={},
+                metric_value_kwargs={"template_dict": {}, "query": query},
+                metrics={},
+                runtime_configuration={},
+            )
+
+        message = str(exc_info.value)
+        assert "active" in message
+        assert "double it" in message
+        assert query in message
+        assert isinstance(exc_info.value.__cause__, KeyError)
+
+    @pytest.mark.unit
+    def test_escaped_braces_still_render_as_literals(
+        self,
+        mock_sqlalchemy_execution_engine: MockSqlAlchemyExecutionEngine,
+    ) -> None:
+        mock_result = create_autospec(sa.engine.CursorResult)
+        mock_result.fetchall.return_value = []
+
+        with (
+            mock.patch.object(
+                mock_sqlalchemy_execution_engine, "execute_query", return_value=mock_result
+            ) as mock_execute_query,
+            mock.patch.object(sa, "text", side_effect=lambda x: x),
+        ):
+            _call_sqlalchemy_metric(
+                QueryTemplateValues,
+                execution_engine=mock_sqlalchemy_execution_engine,
+                metric_domain_kwargs={},
+                metric_value_kwargs={
+                    "template_dict": {"min_count": 3},
+                    "query": "SELECT * FROM {batch} WHERE tags = '{{active}}' AND n > {min_count}",
+                },
+                metrics={},
+                runtime_configuration={},
+            )
+            actual_sql = mock_execute_query.call_args[0][0]
+
+        assert actual_sql == "SELECT * FROM my_table WHERE tags = '{active}' AND n > 3"
+
+    @pytest.mark.unit
+    def test_template_key_named_query_still_substitutes(self) -> None:
+        """A `template_dict` key is user-chosen, so `query` is as valid a key as any other; it must
+        reach `str.format` rather than collide with the query argument of the shared formatter.
+        """
+        selectable = sa.Table("gx_temp_aaa", sa.MetaData(), schema=None)
+
+        formatted_query = QueryTemplateValues().get_query(
+            "SELECT {query} FROM {batch}", {"query": "my_column"}, selectable
+        )
+
+        assert formatted_query == "SELECT my_column FROM gx_temp_aaa"
+
+
+_SPARK_UNSUBSTITUTABLE_QUERY = "SELECT * FROM {batch} WHERE tags = '{active}'"
+_SPARK_ESCAPED_QUERY = "SELECT * FROM {batch} WHERE tags = '{{active}}'"
+
+
+@pytest.fixture
+def spark_engine_with_brace_tags(spark_session):
+    df = pd.DataFrame({"id": [1, 2, 3], "tags": ["{active}", "plain", "{active}"]})
+    return build_spark_engine(spark=spark_session, df=df, batch_id="my_id")
+
+
+class TestSparkQueryBraceSubstitution:
+    """The Spark metrics substitute `{batch}` with their own `str.format` call, separate from the
+    SQL path, so each needs the same report for a brace that is SQL rather than a placeholder.
+    """
+
+    @pytest.mark.spark
+    @pytest.mark.parametrize("metric_class", [QueryTable, QueryRowCount])
+    def test_unsubstitutable_brace_is_reported(
+        self, spark_engine_with_brace_tags, metric_class: type[QueryMetricProvider]
+    ) -> None:
+        with pytest.raises(UnsubstitutableQueryBraceError) as exc_info:
+            _call_spark_metric(
+                metric_class,
+                execution_engine=spark_engine_with_brace_tags,
+                metric_domain_kwargs={},
+                metric_value_kwargs={"query": _SPARK_UNSUBSTITUTABLE_QUERY},
+                metrics={},
+                runtime_configuration={},
+            )
+
+        message = str(exc_info.value)
+        assert "active" in message
+        assert "double it" in message
+        assert _SPARK_UNSUBSTITUTABLE_QUERY in message
+        assert isinstance(exc_info.value.__cause__, KeyError)
+
+    @pytest.mark.spark
+    def test_query_table_escaped_braces_still_run(self, spark_engine_with_brace_tags) -> None:
+        rows = _call_spark_metric(
+            QueryTable,
+            execution_engine=spark_engine_with_brace_tags,
+            metric_domain_kwargs={},
+            metric_value_kwargs={"query": _SPARK_ESCAPED_QUERY},
+            metrics={},
+            runtime_configuration={},
+        )
+
+        assert sorted(rows, key=lambda row: row["id"]) == [
+            {"id": 1, "tags": "{active}"},
+            {"id": 3, "tags": "{active}"},
+        ]
+
+    @pytest.mark.spark
+    def test_query_row_count_escaped_braces_still_run(self, spark_engine_with_brace_tags) -> None:
+        row_count = _call_spark_metric(
+            QueryRowCount,
+            execution_engine=spark_engine_with_brace_tags,
+            metric_domain_kwargs={},
+            metric_value_kwargs={"query": _SPARK_ESCAPED_QUERY},
+            metrics={},
+            runtime_configuration={},
+        )
+
+        assert row_count == 2
+
+    @pytest.mark.spark
+    def test_query_template_values_unsubstitutable_brace_is_reported(
+        self, spark_engine_with_brace_tags
+    ) -> None:
+        with pytest.raises(UnsubstitutableQueryBraceError) as exc_info:
+            _call_spark_metric(
+                QueryTemplateValues,
+                execution_engine=spark_engine_with_brace_tags,
+                metric_domain_kwargs={},
+                metric_value_kwargs={
+                    "template_dict": {},
+                    "query": _SPARK_UNSUBSTITUTABLE_QUERY,
+                },
+                metrics={},
+                runtime_configuration={},
+            )
+
+        assert "double it" in str(exc_info.value)
+        assert isinstance(exc_info.value.__cause__, KeyError)
+
+    @pytest.mark.spark
+    def test_query_template_values_escaped_braces_still_run(
+        self, spark_engine_with_brace_tags
+    ) -> None:
+        rows = _call_spark_metric(
+            QueryTemplateValues,
+            execution_engine=spark_engine_with_brace_tags,
+            metric_domain_kwargs={},
+            metric_value_kwargs={
+                "template_dict": {"min_id": 2},
+                "query": _SPARK_ESCAPED_QUERY + " AND id > {min_id}",
+            },
+            metrics={},
+            runtime_configuration={},
+        )
+
+        assert rows == [{"id": 3, "tags": "{active}"}]
