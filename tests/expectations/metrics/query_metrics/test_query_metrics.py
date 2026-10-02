@@ -1441,16 +1441,32 @@ class TestSparkQueryBraceSubstitution:
     """
 
     @pytest.mark.spark
-    @pytest.mark.parametrize("metric_class", [QueryTable, QueryRowCount])
+    @pytest.mark.parametrize(
+        "metric_class, column_kwargs",
+        [
+            pytest.param(QueryTable, {}, id="QueryTable"),
+            pytest.param(QueryRowCount, {}, id="QueryRowCount"),
+            pytest.param(QueryColumn, {"column": "tags"}, id="QueryColumn"),
+            pytest.param(
+                QueryColumnPair, {"column_A": "id", "column_B": "tags"}, id="QueryColumnPair"
+            ),
+            pytest.param(
+                QueryMultipleColumns, {"columns": ["id", "tags"]}, id="QueryMultipleColumns"
+            ),
+        ],
+    )
     def test_unsubstitutable_brace_is_reported(
-        self, spark_engine_with_brace_tags, metric_class: type[QueryMetricProvider]
+        self,
+        spark_engine_with_brace_tags,
+        metric_class: type[QueryMetricProvider],
+        column_kwargs: dict,
     ) -> None:
         with pytest.raises(UnsubstitutableQueryBraceError) as exc_info:
             _call_spark_metric(
                 metric_class,
                 execution_engine=spark_engine_with_brace_tags,
                 metric_domain_kwargs={},
-                metric_value_kwargs={"query": _SPARK_UNSUBSTITUTABLE_QUERY},
+                metric_value_kwargs={"query": _SPARK_UNSUBSTITUTABLE_QUERY, **column_kwargs},
                 metrics={},
                 runtime_configuration={},
             )
@@ -1489,6 +1505,56 @@ class TestSparkQueryBraceSubstitution:
         )
 
         assert row_count == 2
+
+    @pytest.mark.spark
+    @pytest.mark.parametrize(
+        "metric_class, query, column_kwargs, expected_rows",
+        [
+            pytest.param(
+                QueryColumn,
+                "SELECT {col} AS a FROM {batch} WHERE tags = '{{active}}'",
+                {"column": "id"},
+                [{"a": 1}, {"a": 3}],
+                id="QueryColumn",
+            ),
+            pytest.param(
+                QueryColumnPair,
+                "SELECT {column_A} AS a, {column_B} AS b FROM {batch} WHERE tags = '{{active}}'",
+                {"column_A": "id", "column_B": "tags"},
+                [{"a": 1, "b": "{active}"}, {"a": 3, "b": "{active}"}],
+                id="QueryColumnPair",
+            ),
+            pytest.param(
+                QueryMultipleColumns,
+                "SELECT {col_1} AS a, {col_2} AS b FROM {batch} WHERE tags = '{{active}}'",
+                {"columns": ["id", "tags"]},
+                [{"a": 1, "b": "{active}"}, {"a": 3, "b": "{active}"}],
+                id="QueryMultipleColumns",
+            ),
+        ],
+    )
+    def test_column_metric_escaped_braces_and_columns_still_substitute(
+        self,
+        spark_engine_with_brace_tags,
+        metric_class: type[QueryMetricProvider],
+        query: str,
+        column_kwargs: dict,
+        expected_rows: list[dict],
+    ) -> None:
+        """Each column metric fills its own column placeholders alongside `{batch}`; routing them
+        through the shared formatter must keep those and turn doubled braces into literals.
+        """
+        rows = _call_spark_metric(
+            metric_class,
+            execution_engine=spark_engine_with_brace_tags,
+            metric_domain_kwargs={},
+            metric_value_kwargs={"query": query, **column_kwargs},
+            metrics={},
+            runtime_configuration={},
+        )
+
+        # Aliased by position, so a column bound to the wrong placeholder changes the rows.
+        assert sorted(rows, key=lambda row: row["a"]) == expected_rows
 
     @pytest.mark.spark
     def test_query_template_values_unsubstitutable_brace_is_reported(
