@@ -8,7 +8,7 @@ import re
 import uuid
 import warnings
 from typing import Any, Optional
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import ParseResult, urlparse, urlunparse
 
 from great_expectations.alias_types import PathStr  # noqa: TC001 # FIXME CoP
 from great_expectations.compatibility.postgresql import resolve_postgresql_driver
@@ -159,6 +159,14 @@ def parse_substitution_variable(substitution_variable: str) -> Optional[str]:
 # RFC 3986: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ). urlparse() rejects anything
 # else, so a scheme carrying "_" - "oracle+cx_oracle" - is parsed as if the URL had no scheme.
 _RFC_3986_SCHEME_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9+.\-]*")
+
+# A database URL scheme as SQLAlchemy accepts one: RFC 3986 plus "_" ("oracle+cx_oracle").
+_DB_URL_SCHEME_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9+.\-_]*")
+
+
+# The userinfo SQLAlchemy recognises at the start of the part after "://": a username, then an
+# optional password running up to the "@" (so it may contain "/", "?" and "#").
+_USERINFO_RE = re.compile(r"(?P<username>[^:/]*)(?::(?P<password>[^@]*))?@")
 
 
 class PasswordMasker:
@@ -317,21 +325,34 @@ class PasswordMasker:
         Both branches of mask_db_url() go through here, so a URL that carries a credential in
         its query string is masked the same way whether or not SQLAlchemy could parse it.
         """
-        # urlparse() rejects "_" in a scheme, so "oracle+cx_oracle://..." parses as if it carried
-        # no scheme at all, dropping the whole URL - query string included - into `path`, where
-        # nothing masks it. Parse those as plain "oracle" and put the real scheme back on the
-        # parsed object. Swapping the string back afterwards instead also rewrites an "oracle"
-        # that happens to appear in the host or the path.
-        scheme, separator, _ = url.partition(":")
-        if separator and not _RFC_3986_SCHEME_RE.fullmatch(scheme):
-            remainder = url[len(scheme) + 1 :]
-            parsed_url = urlparse(f"oracle:{remainder}")._replace(scheme=scheme)
-        else:
-            parsed_url = urlparse(url)
+        scheme, _, after_scheme = url.partition(":")
 
-        # Do not parse sqlite
-        if parsed_url.scheme == "sqlite":
+        # Anything that is not "<scheme>://..." is not a database URL - a raw ODBC string such as
+        # "Driver={...};Server=tcp:h,1433;Uid=u;Pwd=secret", say - and nothing here can tell its
+        # secret apart from the rest. Fail closed and mask it whole.
+        if not (_DB_URL_SCHEME_RE.fullmatch(scheme) and after_scheme.startswith("//")):
+            return cls.MASKED_PASSWORD_STRING
+
+        parsed_url = cls._parse_db_url(url, scheme, after_scheme)
+        if parsed_url is None:
+            # Nothing past the scheme can be told apart from a password, so fail closed: masking
+            # is this function's one job, and raising instead would fail every config it
+            # sanitizes. The scheme was checked above, so it is safe to show.
+            return f"{scheme}://{cls.MASKED_PASSWORD_STRING}"
+
+        # Do not parse sqlite, however its driver is spelled: "sqlite+pysqlite://" is the same
+        # database as "sqlite://".
+        if parsed_url.scheme.partition("+")[0] == "sqlite":
             return url
+
+        # An unencoded "/", "?" or "#" in a password ends the netloc early, so the "@" after it
+        # never reaches the netloc and the password would pass through unmasked. That holds even
+        # when the netloc does contain an "@" - a username such as "user@server" puts one there.
+        # SQLAlchemy takes everything up to the next "@" as the password (`[^@]*`); mask it the
+        # same way, then parse again. A rewritten URL rewrites to itself, so this recurses once.
+        rewritten = cls._mask_password_ending_the_netloc(url, scheme)
+        if rewritten != url:
+            return cls._mask_url(rewritten)
 
         # Replace only the password inside the netloc and re-emit every other component the
         # URL actually carried. Rebuilding the netloc from username/hostname/port drops the
@@ -360,6 +381,37 @@ class PasswordMasker:
             masked_url = masked_url.replace(f"{parsed_url.scheme}:", f"{parsed_url.scheme}://", 1)
 
         return masked_url
+
+    @staticmethod
+    def _parse_db_url(url: str, scheme: str, after_scheme: str) -> Optional[ParseResult]:
+        """Parse a database URL, or return None when urlparse() cannot read its netloc.
+
+        urlparse() rejects "_" in a scheme, so "oracle+cx_oracle://..." parses as if it carried
+        no scheme at all, dropping the whole URL - query string included - into `path`, where
+        nothing masks it. Parse those as plain "oracle" and put the real scheme back on the
+        parsed object. Swapping the string back afterwards instead also rewrites an "oracle"
+        that happens to appear in the host or the path.
+
+        urlparse() raises on a netloc it cannot read, such as an unbalanced IPv6 "[".
+        """
+        try:
+            if not _RFC_3986_SCHEME_RE.fullmatch(scheme):
+                return urlparse(f"oracle:{after_scheme}")._replace(scheme=scheme)
+            return urlparse(url)
+        except ValueError:
+            return None
+
+    @classmethod
+    def _mask_password_ending_the_netloc(cls, url: str, scheme: str) -> str:
+        """Mask a password holding an unencoded "/", "?" or "#", which urlparse() splits off."""
+        _, authority_separator, after_scheme = url.partition("://")
+        credentials = _USERINFO_RE.match(after_scheme) if authority_separator else None
+        if not credentials or credentials.group("password") is None:
+            return url
+        return (
+            f"{scheme}://{credentials.group('username')}:{cls.MASKED_PASSWORD_STRING}@"
+            f"{after_scheme[credentials.end() :]}"
+        )
 
     @classmethod
     def _mask_query_string(cls, query: str) -> str:

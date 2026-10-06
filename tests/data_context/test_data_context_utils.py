@@ -1,5 +1,6 @@
 import logging
 import os
+import sys
 from urllib.parse import parse_qsl, urlsplit
 
 import pytest
@@ -57,6 +58,26 @@ def test_mask_db_url__does_not_mask_config_strings():
     config_str = "${MY_DB_URL}"
     output = PasswordMasker.mask_db_url(config_str)
     assert output == config_str
+
+
+@pytest.mark.postgresql
+def test_mask_db_url__driverless_postgresql_url_with_only_psycopg2_installed(monkeypatch, caplog):
+    """A driverless postgresql:// URL masks identically when only psycopg2 is installed.
+
+    SQLAlchemy 2.1 defaults such a URL to psycopg (3). With that driver unimportable the
+    psycopg2 fallback is used, and the result must still describe the URL as configured,
+    with nothing logged.
+    """
+    pytest.importorskip("sqlalchemy")
+    pytest.importorskip("psycopg2")
+    # A None entry in sys.modules makes `import psycopg` raise ImportError.
+    monkeypatch.setitem(sys.modules, "psycopg", None)
+
+    with caplog.at_level(logging.DEBUG):
+        masked = PasswordMasker.mask_db_url("postgresql://scott:tiger@h:5432/db?sslmode=require")
+
+    assert masked == "postgresql://scott:***@h:5432/db?sslmode=require"
+    assert caplog.records == []
 
 
 @pytest.mark.filesystem
@@ -654,18 +675,77 @@ def test_mask_db_url_with_urlparse_never_echoes_the_password(url):
 @pytest.mark.filterwarnings(
     "ignore:SQLAlchemy is not installed*:UserWarning:great_expectations.data_context.util"
 )
-def test_mask_db_url_with_urlparse_matches_sqlalchemy_rendering():
-    """Both paths must agree on every component of a masked URL, not merely on its password.
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        pytest.param(
+            "postgresql://scott:pa/ss@h:5432/db",
+            "postgresql://scott:***@h:5432/db",
+            id="slash_in_password",
+        ),
+        pytest.param(
+            "postgresql://scott:pa#ss@h/db",
+            "postgresql://scott:***@h/db",
+            id="hash_in_password",
+        ),
+        pytest.param(
+            "postgresql://scott:pa?ss@h/db",
+            "postgresql://scott:***@h/db",
+            id="question_mark_in_password",
+        ),
+        # A "user@server" username (Azure SQL, Azure Postgres single server) or an email
+        # username (Snowflake) puts an "@" inside the netloc urlparse() sees, ahead of the one
+        # that ends the password.
+        pytest.param(
+            "mssql+pyodbc://user@myserver:pa/ss@myserver.database.windows.net:1433/db?driver=ODBC+Driver+18",
+            "mssql+pyodbc://user@myserver:***@myserver.database.windows.net:1433/db?driver=ODBC+Driver+18",
+            id="at_in_username_slash_in_password",
+        ),
+        pytest.param(
+            "snowflake://me@corp.com:p#w@acct/db",
+            "snowflake://me@corp.com:***@acct/db",
+            id="at_in_username_hash_in_password",
+        ),
+        pytest.param(
+            "postgresql://user@srv:Pa?ss@srv.postgres.database.azure.com/db",
+            "postgresql://user@srv:***@srv.postgres.database.azure.com/db",
+            id="at_in_username_question_mark_in_password",
+        ),
+        pytest.param(
+            "postgresql://user@srv:plainpw@srv.postgres.database.azure.com/db",
+            "postgresql://user@srv:***@srv.postgres.database.azure.com/db",
+            id="at_in_username_plain_password",
+        ),
+    ],
+)
+def test_mask_db_url_with_urlparse_masks_a_password_holding_a_url_delimiter(url, expected):
+    """An unencoded delimiter in the password ends the netloc early; it must still be masked."""
+    assert PasswordMasker.mask_db_url(url, use_urlparse=True) == expected
 
-    This is the invariant `test_password_masker_mask_db_url` states in its docstring. The two
-    are compared component-wise rather than byte for byte, because SQLAlchemy re-orders and
-    percent-encodes a query dict of its own making: the difference is presentation only, never
-    a dropped, invented or differently-masked component.
-    """
-    pytest.importorskip("sqlalchemy")
-    from sqlalchemy.engine.url import make_url
 
-    for url in [
+@pytest.mark.unit
+@pytest.mark.filterwarnings(
+    "ignore:SQLAlchemy is not installed*:UserWarning:great_expectations.data_context.util"
+)
+@pytest.mark.parametrize(
+    "url",
+    [
+        "sqlite:///foo.db?mode=ro&uri=true",
+        "sqlite+pysqlite:///foo.db?mode=ro&uri=true",
+    ],
+)
+@pytest.mark.parametrize("use_urlparse", [True, False], ids=["urlparse", "sqlalchemy"])
+def test_mask_db_url_leaves_sqlite_urls_alone_whatever_the_driver(url, use_urlparse):
+    assert PasswordMasker.mask_db_url(url, use_urlparse=use_urlparse) == url
+
+
+@pytest.mark.unit
+@pytest.mark.filterwarnings(
+    "ignore:SQLAlchemy is not installed*:UserWarning:great_expectations.data_context.util"
+)
+@pytest.mark.parametrize(
+    "url",
+    [
         "postgresql://scott:tiger@h:5432/db?sslmode=require",
         "postgresql://scott:tiger@[::1]:5432/db?sslmode=require",
         "postgresql://scott@h:5432/db",
@@ -677,15 +757,33 @@ def test_mask_db_url_with_urlparse_matches_sqlalchemy_rendering():
         "snowflake://user:pass@acct/db?role=PUBLIC&warehouse=WH",
         "postgresql://scott:tiger@h:5432/db?sslmode=require&password=hunter2",
         "postgresql://scott:tiger@h:5432/db#section",
-    ]:
-        masked = PasswordMasker.mask_db_url(url, use_urlparse=True)
-        reference = make_url(url)._replace(**_masked_query_reference(masked))
-        assert _components(masked) == _components(reference.__repr__())
+        "mysql+pymysql://scott:tiger@/db?unix_socket=/tmp/mysql.sock",
+        "oracle+cx_oracle://scott:tiger@tnsname?ssl_cert=/tmp/c.pem",
+        "oracle+cx_oracle://scott:tiger@oracle-db.example.com:1521/sid",
+        "mssql+pyodbc:///?odbc_connect=Server%3Dh%3BPWD%3Dhunter2",
+    ],
+)
+def test_mask_db_url_with_urlparse_matches_sqlalchemy_rendering(url, caplog):
+    """Both paths must agree on every component of a masked URL, not merely on its password.
 
+    This is the invariant `test_password_masker_mask_db_url` states in its docstring. The two
+    are compared component-wise rather than byte for byte, because SQLAlchemy re-orders and
+    percent-encodes a query dict of its own making: the difference is presentation only, never
+    a dropped, invented or differently-masked component.
 
-def _masked_query_reference(masked: str) -> dict:
-    """The query dict SQLAlchemy would have to hold for it to render `masked`."""
-    return {"query": dict(parse_qsl(urlsplit(masked).query))}
+    When the URL's dialect driver is not installed, `mask_db_url` falls back to the same
+    function the urlparse path uses, so the comparison would be between a path and itself. That
+    case is skipped rather than counted as a pass.
+    """
+    pytest.importorskip("sqlalchemy")
+
+    via_urlparse = PasswordMasker.mask_db_url(url, use_urlparse=True)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="great_expectations.data_context.util"):
+        via_sqlalchemy = PasswordMasker.mask_db_url(url, use_urlparse=False)
+    if any("Something went wrong when trying to use SQLAlchemy" in m for m in caplog.messages):
+        pytest.skip(f"SQLAlchemy cannot build an engine for {url!r} here; both paths are the same")
+    assert _components(via_urlparse) == _components(via_sqlalchemy)
 
 
 def _components(url: str) -> tuple:
@@ -782,6 +880,82 @@ def test_mask_db_url_never_returns_an_unparseable_url_unmasked(url):
     assert "tiger" not in masked
     assert "hunter2" not in masked
     assert PasswordMasker.MASKED_PASSWORD_STRING in masked
+
+
+@pytest.mark.unit
+@pytest.mark.filterwarnings(
+    "ignore:SQLAlchemy is not installed*:UserWarning:great_expectations.data_context.util"
+)
+@pytest.mark.parametrize(
+    "url",
+    [
+        # Read the way SQLAlchemy reads a URL, the "@" in the query ends a password that starts
+        # inside the IPv6 brackets, leaving an unbalanced "[" that urlparse() refuses.
+        pytest.param("postgresql://user@[::1]:5432/db?x=a@b", id="ipv6_user_and_later_at"),
+        pytest.param("postgresql://[::1]:5432/db?x=a@b", id="ipv6_no_userinfo_and_later_at"),
+        pytest.param("postgresql://[%e9:SECRETZ@", id="unbalanced_ipv6_bracket"),
+    ],
+)
+def test_mask_db_url_with_urlparse_fails_closed_when_the_netloc_cannot_be_parsed(url):
+    """A netloc urlparse() cannot read is masked whole, never raised on or passed through."""
+    assert PasswordMasker.mask_db_url(url, use_urlparse=True) == "postgresql://***"
+
+
+@pytest.mark.unit
+@pytest.mark.filterwarnings(
+    "ignore:SQLAlchemy is not installed*:UserWarning:great_expectations.data_context.util"
+)
+@pytest.mark.parametrize("use_urlparse", [True, False], ids=["urlparse", "sqlalchemy"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(
+            "Driver={ODBC Driver 18 for SQL Server};Server=tcp:myserver.database.windows.net,1433;"
+            "Database=db;Uid=user;Pwd=SECRET;Encrypt=yes",
+            id="odbc_connection_string",
+        ),
+        pytest.param(
+            "Uid=sa;Pwd=SECRET;Server=tcp://h", id="odbc_string_containing_scheme_slashes"
+        ),
+        pytest.param(
+            "Uid=sa;Pwd=SECRET;Server=tcp://[fe80::1", id="odbc_string_with_unbalanced_ipv6"
+        ),
+        pytest.param("scott:SECRET@h/db", id="userinfo_without_scheme"),
+        pytest.param("//scott:SECRET@h/db", id="authority_without_scheme"),
+    ],
+)
+def test_mask_db_url_masks_a_value_that_is_not_a_url_whole(value, use_urlparse):
+    """Text that is not "<scheme>://..." has no part masking could safely leave readable."""
+    assert PasswordMasker.mask_db_url(value, use_urlparse=use_urlparse) == "***"
+
+
+@pytest.mark.unit
+@pytest.mark.filterwarnings(
+    "ignore:SQLAlchemy is not installed*:UserWarning:great_expectations.data_context.util"
+)
+def test_sanitize_config_masks_a_raw_odbc_connection_string():
+    """A raw ODBC string under a URL key must not reach the sanitized config with its Pwd=."""
+    odbc = (
+        "Driver={ODBC Driver 18 for SQL Server};Server=tcp:myserver.database.windows.net,1433;"
+        "Database=db;Uid=user;Pwd=SECRET;Encrypt=yes"
+    )
+    assert PasswordMasker.sanitize_config({"connection_string": odbc}) == {
+        "connection_string": "***"
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.filterwarnings(
+    "ignore:SQLAlchemy is not installed*:UserWarning:great_expectations.data_context.util"
+)
+def test_sanitize_config_does_not_raise_on_an_unparseable_ipv6_url_when_no_driver_loads(
+    monkeypatch,
+):
+    """With no driver SQLAlchemy can load, the fallback masks the URL rather than raising."""
+    monkeypatch.setitem(sys.modules, "psycopg2", None)
+    monkeypatch.setitem(sys.modules, "psycopg", None)
+    config = {"url": "postgresql://user@[::1]:5432/db?x=a@b"}
+    assert PasswordMasker.sanitize_config(config) == {"url": "postgresql://***"}
 
 
 @pytest.mark.unit
